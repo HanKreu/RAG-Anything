@@ -384,6 +384,7 @@ class QueryMixin:
                     enhanced_parts.append(
                         f"\nRelated {content_type} content: {description}"
                     )
+                    self.logger.info(f"📝 Added {content_type} description to query: {description[:200]}...")
                 else:
                     # If no appropriate processor, use basic description
                     basic_desc = str(content)[:200]
@@ -400,6 +401,7 @@ class QueryMixin:
         enhanced_query += PROMPTS["QUERY_ENHANCEMENT_SUFFIX"]
 
         self.logger.info("Multimodal query content processing completed")
+        self.logger.info(f"🔍 Full enhanced query being sent:\n{'-'*80}\n{enhanced_query}\n{'-'*80}")
         return enhanced_query
 
     async def _generate_query_content_description(
@@ -442,14 +444,17 @@ class QueryMixin:
 
         if image_path and Path(image_path).exists():
             # If image exists, use vision model to generate description
+            self.logger.info(f"📸 Analyzing uploaded query image: {image_path}")
             image_base64 = processor._encode_image_to_base64(image_path)
             if image_base64:
                 prompt = PROMPTS["QUERY_IMAGE_DESCRIPTION"]
+                self.logger.info(f"🔍 Sending image to vision model with prompt: {prompt[:100]}...")
                 description = await processor.modal_caption_func(
                     prompt,
                     image_data=image_base64,
                     system_prompt=PROMPTS["QUERY_IMAGE_ANALYST_SYSTEM"],
                 )
+                self.logger.info(f"✅ Vision model analysis result: {description}")
                 return description
 
         # If image doesn't exist or processing failed, use existing information
