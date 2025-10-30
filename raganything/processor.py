@@ -297,6 +297,54 @@ class ProcessorMixin:
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
+        # Check for page limits configuration
+        page_limits = self.get_page_limits_for_file(str(file_path))
+        if page_limits:
+            start_page, end_page = page_limits
+            self.logger.info(f"Applying page limits: pages {start_page}-{end_page}")
+            # Add page limits to kwargs if not already specified
+            if 'start_page' not in kwargs:
+                kwargs['start_page'] = start_page
+            if 'end_page' not in kwargs:
+                kwargs['end_page'] = end_page
+
+        # Check if parsed output already exists on disk (faster than cache lookup)
+        file_stem = file_path.stem
+        output_dir_path = Path(output_dir) if output_dir else Path(self.config.parser_output_dir)
+        
+        # Determine where the parser would have saved the output
+        # Structure: output_dir/file_stem/parser_name/file_stem.json
+        parser_name = self.config.parser  # "docling" or "mineru"
+        json_file = output_dir_path / file_stem / parser_name / f"{file_stem}.json"
+        
+        if json_file.exists():
+            self.logger.info(f"Found existing parsed output: {json_file}")
+            try:
+                # Read the existing parsed output
+                # Create parser instance (DoclingParser._read_output_files is an instance method, not static)
+                parser_instance = DoclingParser() if self.config.parser == "docling" else MineruParser()
+                content_list, _ = parser_instance._read_output_files(
+                    output_dir_path, file_stem
+                )
+                
+                # Generate doc_id from content
+                doc_id = self._generate_content_based_doc_id(content_list)
+                
+                self.logger.info(f"Loaded {len(content_list)} blocks from existing parsed output")
+                if display_stats:
+                    self.logger.info(f"* Total blocks in content_list: {len(content_list)}")
+                
+                # Store in cache for future lookups
+                cache_key = self._generate_cache_key(file_path, parse_method, **kwargs)
+                await self._store_cached_result(
+                    cache_key, content_list, doc_id, file_path, parse_method, **kwargs
+                )
+                
+                return content_list, doc_id
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to load existing parsed output: {e}. Will re-parse.")
+
         # Generate cache key based on file and configuration
         cache_key = self._generate_cache_key(file_path, parse_method, **kwargs)
 
@@ -984,15 +1032,115 @@ class ProcessorMixin:
     async def _store_chunks_to_lightrag_storage_type_aware(
         self, chunks: Dict[str, Any]
     ):
-        """Store chunks to storage"""
+        """Store chunks to storage, splitting large chunks if needed while preserving context"""
         try:
             # Store in text_chunks storage (required for extract_entities)
             await self.lightrag.text_chunks.upsert(chunks)
 
-            # Store in chunks vector database for retrieval
-            await self.lightrag.chunks_vdb.upsert(chunks)
+            # Check for large chunks and split them for embedding
+            max_embed_tokens = 7000  # Safe limit below 8192
+            chunks_for_vdb = {}
+            
+            for chunk_id, chunk_data in chunks.items():
+                tokens = chunk_data.get("tokens", 0)
+                content = chunk_data.get("content", "")
+                
+                if tokens > max_embed_tokens:
+                    # For large multimodal content, preserve context while splitting
+                    self.logger.warning(f"Chunk {chunk_id} has {tokens} tokens, splitting for embedding (limit: {max_embed_tokens})")
+                    
+                    # Try to split intelligently by sections
+                    parts = content.split('\n\n')
+                    
+                    # Find the main content body (largest part that exceeds half the limit)
+                    body_candidates = [(i, part) for i, part in enumerate(parts) 
+                                     if len(self.lightrag.tokenizer.encode(part)) > max_embed_tokens // 2]
+                    
+                    if body_candidates:
+                        # Found a large section - split it while keeping context
+                        body_idx, body_content = body_candidates[0]
+                        context_parts = [p for i, p in enumerate(parts) if i != body_idx]
+                        context_text = '\n\n'.join(context_parts)
+                        context_tokens = len(self.lightrag.tokenizer.encode(context_text))
+                        
+                        # Available tokens for body in each sub-chunk
+                        available_for_body = max_embed_tokens - context_tokens - 100  # Safety margin
+                        
+                        if available_for_body > 500:  # Minimum useful size
+                            # Split the body content
+                            body_encoded = self.lightrag.tokenizer.encode(body_content)
+                            num_body_parts = (len(body_encoded) + available_for_body - 1) // available_for_body
+                            
+                            for i in range(0, len(body_encoded), available_for_body):
+                                part_num = i // available_for_body
+                                chunk_part = self.lightrag.tokenizer.decode(body_encoded[i:i + available_for_body])
+                                
+                                # Reconstruct with context preserved
+                                if body_idx == 0:
+                                    # Body was first, context after
+                                    sub_content = f"{chunk_part} [Part {part_num+1}/{num_body_parts}]\n\n{context_text}"
+                                else:
+                                    # Context before body
+                                    before_body = '\n\n'.join(parts[:body_idx])
+                                    after_body = '\n\n'.join(parts[body_idx+1:]) if body_idx < len(parts)-1 else ""
+                                    
+                                    if after_body:
+                                        sub_content = f"{before_body}\n\n{chunk_part} [Part {part_num+1}/{num_body_parts}]\n\n{after_body}"
+                                    else:
+                                        sub_content = f"{before_body}\n\n{chunk_part} [Part {part_num+1}/{num_body_parts}]"
+                                
+                                sub_chunk_id = f"{chunk_id}_part{part_num}"
+                                sub_tokens = len(self.lightrag.tokenizer.encode(sub_content))
+                                
+                                chunks_for_vdb[sub_chunk_id] = {
+                                    **chunk_data,  # Copy all metadata
+                                    "content": sub_content,
+                                    "tokens": sub_tokens,
+                                }
+                            
+                            self.logger.info(f"Split chunk into {num_body_parts} parts (preserving context: {context_tokens} tokens)")
+                        else:
+                            # Context too large, fallback to simple split
+                            self.logger.warning(f"Context too large, using simple token split")
+                            encoded_tokens = self.lightrag.tokenizer.encode(content)
+                            num_parts = (len(encoded_tokens) + max_embed_tokens - 1) // max_embed_tokens
+                            
+                            for i in range(0, len(encoded_tokens), max_embed_tokens):
+                                sub_chunk_tokens = encoded_tokens[i:i + max_embed_tokens]
+                                sub_chunk_content = self.lightrag.tokenizer.decode(sub_chunk_tokens)
+                                part_num = i // max_embed_tokens
+                                sub_chunk_id = f"{chunk_id}_part{part_num}"
+                                
+                                chunks_for_vdb[sub_chunk_id] = {
+                                    **chunk_data,
+                                    "content": sub_chunk_content,
+                                    "tokens": len(sub_chunk_tokens),
+                                }
+                    else:
+                        # No dominant section, use simple token split
+                        encoded_tokens = self.lightrag.tokenizer.encode(content)
+                        num_parts = (len(encoded_tokens) + max_embed_tokens - 1) // max_embed_tokens
+                        
+                        for i in range(0, len(encoded_tokens), max_embed_tokens):
+                            sub_chunk_tokens = encoded_tokens[i:i + max_embed_tokens]
+                            sub_chunk_content = self.lightrag.tokenizer.encode(sub_chunk_tokens)
+                            part_num = i // max_embed_tokens
+                            sub_chunk_id = f"{chunk_id}_part{part_num}"
+                            
+                            chunks_for_vdb[sub_chunk_id] = {
+                                **chunk_data,
+                                "content": sub_chunk_content,
+                                "tokens": len(sub_chunk_tokens),
+                            }
+                        self.logger.info(f"Split into {num_parts} parts using token split")
+                else:
+                    # Chunk is within limits
+                    chunks_for_vdb[chunk_id] = chunk_data
 
-            self.logger.debug(f"Stored {len(chunks)} multimodal chunks to storage")
+            # Store in chunks vector database for retrieval
+            await self.lightrag.chunks_vdb.upsert(chunks_for_vdb)
+
+            self.logger.debug(f"Stored {len(chunks)} chunks ({len(chunks_for_vdb)} after splitting) to storage")
 
         except Exception as e:
             self.logger.error(f"Error storing chunks to storage: {e}")
@@ -1450,7 +1598,8 @@ class ProcessorMixin:
 
         self.logger.info(f"Starting complete document processing: {file_path}")
 
-        # Step 1: Parse document
+        # Step 1: Parse document (with caching support)
+        # Note: Parsing is lightweight when cached and needed to generate doc_id
         content_list, content_based_doc_id = await self.parse_document(
             file_path, output_dir, parse_method, display_stats, **kwargs
         )
@@ -1459,8 +1608,59 @@ class ProcessorMixin:
         if doc_id is None:
             doc_id = content_based_doc_id
 
+        # Step 1.5: Check if document is already fully indexed in LightRAG
+        # This check happens AFTER parsing (which is cached) but BEFORE indexing
+        from lightrag.base import DocStatus
+        existing_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+        
+        if existing_doc_status:
+            status = existing_doc_status.get("status") if isinstance(existing_doc_status, dict) else getattr(existing_doc_status, "status", None)
+            
+            if status == DocStatus.PROCESSED:
+                self.logger.info("="*80)
+                self.logger.info("✓ DOCUMENT ALREADY INDEXED - SKIPPING")
+                self.logger.info(f"  Document ID: {doc_id}")
+                self.logger.info(f"  File: {file_path}")
+                self.logger.info(f"  Status: {status}")
+                self.logger.info("  The document is already fully processed and indexed in the vector store.")
+                self.logger.info("  Parsing was used from cache to verify document identity.")
+                self.logger.info("="*80)
+                return
+            elif status in [DocStatus.PROCESSING, DocStatus.PENDING]:
+                self.logger.info("="*80)
+                self.logger.info("⚠ DOCUMENT CURRENTLY BEING PROCESSED - SKIPPING")
+                self.logger.info(f"  Document ID: {doc_id}")
+                self.logger.info(f"  File: {file_path}")
+                self.logger.info(f"  Status: {status}")
+                self.logger.info("  Another process is currently handling this document.")
+                self.logger.info("="*80)
+                return
+            elif status == DocStatus.FAILED:
+                self.logger.info("="*80)
+                self.logger.info("⚠ PREVIOUS PROCESSING FAILED - RETRYING")
+                self.logger.info(f"  Document ID: {doc_id}")
+                self.logger.info(f"  File: {file_path}")
+                self.logger.info(f"  Previous status: {status}")
+                self.logger.info("  Will attempt to reprocess the document.")
+                self.logger.info("="*80)
+            elif status == DocStatus.PREPROCESSED:
+                self.logger.info("="*80)
+                self.logger.info("→ CONTINUING WITH INDEXING")
+                self.logger.info(f"  Document ID: {doc_id}")
+                self.logger.info(f"  File: {file_path}")
+                self.logger.info(f"  Status: {status}")
+                self.logger.info("  Document was parsed but not fully indexed. Continuing...")
+                self.logger.info("="*80)
+        else:
+            self.logger.info("="*80)
+            self.logger.info("→ NEW DOCUMENT - PROCEEDING WITH INDEXING")
+            self.logger.info(f"  Document ID: {doc_id}")
+            self.logger.info(f"  File: {file_path}")
+            self.logger.info("  Document not found in index. Will process and index.")
+            self.logger.info("="*80)
+
         # Step 2: Separate text and multimodal content
-        text_content, multimodal_items = separate_content(content_list)
+        text_content, multimodal_items, page_idx_map = separate_content(content_list)
 
         # Step 2.5: Set content source for context extraction in multimodal processing
         if hasattr(self, "set_content_source_for_context") and multimodal_items:
@@ -1481,6 +1681,7 @@ class ProcessorMixin:
                 split_by_character=split_by_character,
                 split_by_character_only=split_by_character_only,
                 ids=doc_id,
+                page_idx_map=page_idx_map,
             )
 
         # Step 4: Process multimodal content (using specialized processors)
@@ -1646,7 +1847,7 @@ class ProcessorMixin:
                 doc_id = content_based_doc_id
 
             # Step 2: Separate text and multimodal content
-            text_content, multimodal_items = separate_content(content_list)
+            text_content, multimodal_items, page_idx_map = separate_content(content_list)
 
             # Step 2.5: Set content source for context extraction in multimodal processing
             if hasattr(self, "set_content_source_for_context") and multimodal_items:
@@ -1668,6 +1869,7 @@ class ProcessorMixin:
                     split_by_character_only=split_by_character_only,
                     ids=doc_id,
                     scheme_name=scheme_name,
+                    page_idx_map=page_idx_map,
                 )
 
             self.logger.info(f"Document {file_path} processing completed successfully")
@@ -1787,7 +1989,7 @@ class ProcessorMixin:
                 self.logger.info(f"  - {block_type}: {count}")
 
         # Step 1: Separate text and multimodal content
-        text_content, multimodal_items = separate_content(content_list)
+        text_content, multimodal_items, page_idx_map = separate_content(content_list)
 
         # Step 1.5: Set content source for context extraction in multimodal processing
         if hasattr(self, "set_content_source_for_context") and multimodal_items:
@@ -1798,7 +2000,7 @@ class ProcessorMixin:
                 content_list, self.config.content_format
             )
 
-        # Step 2: Insert pure text content with all parameters
+        # Step 2: Insert pure text content with all parameters including page_idx_map
         if text_content.strip():
             file_name = os.path.basename(file_path)
             await insert_text_content(
@@ -1808,6 +2010,7 @@ class ProcessorMixin:
                 split_by_character=split_by_character,
                 split_by_character_only=split_by_character_only,
                 ids=doc_id,
+                page_idx_map=page_idx_map,
             )
 
         # Step 3: Process multimodal content (using specialized processors)

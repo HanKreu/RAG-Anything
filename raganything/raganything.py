@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv(dotenv_path=".env", override=False)
 
 from lightrag import LightRAG
-from lightrag.utils import logger
+from lightrag.utils import logger, TokenTracker
 
 # Import configuration and modules
 from raganything.config import RAGAnythingConfig
@@ -67,6 +67,13 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
     config: Optional[RAGAnythingConfig] = field(default=None)
     """Configuration object, if None will create with environment variables."""
 
+    # Token Tracking & Cost Management
+    # ---
+    token_tracker: Optional[TokenTracker] = field(default=None)
+    """Optional token tracker for monitoring token usage and costs across all operations.
+    If not provided, a new TokenTracker will be created automatically.
+    You can configure costs using token_tracker.set_costs() after initialization."""
+
     # LightRAG Configuration
     # ---
     lightrag_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -95,6 +102,9 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
 
     _parser_installation_checked: bool = field(default=False, init=False)
     """Flag to track if parser installation has been checked."""
+    
+    page_limits: Optional[Dict[str, Any]] = field(default=None, init=False)
+    """Page limits configuration loaded from JSON file."""
 
     def __post_init__(self):
         """Post-initialization setup following LightRAG pattern"""
@@ -102,11 +112,18 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
         if self.config is None:
             self.config = RAGAnythingConfig()
 
+        # Initialize token tracker if not provided
+        if self.token_tracker is None:
+            self.token_tracker = TokenTracker()
+
         # Set working directory
         self.working_dir = self.config.working_dir
 
         # Set up logger (use existing logger, don't configure it)
         self.logger = logger
+        
+        # Load page limits configuration if it exists (must be after logger is initialized)
+        self._load_page_limits()
 
         # Set up document parser
         self.doc_parser = (
@@ -132,6 +149,69 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
             f"Equation: {self.config.enable_equation_processing}"
         )
         self.logger.info(f"  Max concurrent files: {self.config.max_concurrent_files}")
+
+    def _load_page_limits(self):
+        """Load page limits configuration from page_limits.json if it exists"""
+        import json
+        from pathlib import Path
+        
+        page_limits_file = Path("page_limits.json")
+        if page_limits_file.exists():
+            try:
+                with open(page_limits_file, "r", encoding="utf-8") as f:
+                    self.page_limits = json.load(f)
+                self.logger.info(f"Loaded page limits configuration from {page_limits_file}")
+                # Remove comment key if present
+                if "_comment" in self.page_limits:
+                    del self.page_limits["_comment"]
+            except Exception as e:
+                self.logger.warning(f"Failed to load page limits from {page_limits_file}: {e}")
+                self.page_limits = {}
+        else:
+            self.page_limits = {}
+    
+    def get_page_limits_for_file(self, file_path: str) -> Optional[tuple[int, int]]:
+        """
+        Get page limits for a specific file
+        
+        Args:
+            file_path: Path to the file (can be absolute or relative)
+        
+        Returns:
+            Optional[tuple[int, int]]: (start_page, end_page) both 1-based, inclusive
+                                       or None if no limits specified
+        """
+        if not self.page_limits:
+            return None
+        
+        from pathlib import Path
+        file_path_obj = Path(file_path)
+        
+        # Try exact match first
+        if str(file_path) in self.page_limits:
+            limit = self.page_limits[str(file_path)]
+        # Try with normalized separators (for cross-platform compatibility)
+        elif str(file_path).replace("\\", "/") in self.page_limits:
+            limit = self.page_limits[str(file_path).replace("\\", "/")]
+        # Try just the filename
+        elif file_path_obj.name in self.page_limits:
+            limit = self.page_limits[file_path_obj.name]
+        else:
+            return None
+        
+        if limit is None:
+            return None
+        
+        # Handle different limit formats
+        if isinstance(limit, int):
+            # Single number means pages 1 to limit
+            return (1, limit)
+        elif isinstance(limit, list) and len(limit) == 2:
+            # [start, end] range (both inclusive, 1-based)
+            return (limit[0], limit[1])
+        else:
+            self.logger.warning(f"Invalid page limit format for {file_path}: {limit}")
+            return None
 
     def close(self):
         """Cleanup resources when object is destroyed"""
@@ -225,6 +305,85 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
             else:
                 self.logger.warning(f"Unknown config parameter: {key}")
 
+    def configure_token_costs(
+        self,
+        llm_prompt_cost_per_million: float = None,
+        llm_completion_cost_per_million: float = None,
+        vision_prompt_cost_per_million: float = None,
+        vision_completion_cost_per_million: float = None,
+        embedding_cost_per_million: float = None,
+    ):
+        """Configure token costs for cost tracking.
+        
+        This method allows you to set the cost per million tokens for different operations.
+        Once configured, the token tracker will automatically calculate costs.
+        Supports separate pricing for text LLM, vision LLM, and embedding models.
+        
+        Args:
+            llm_prompt_cost_per_million: Cost per 1M text LLM prompt tokens (e.g., 0.15 for $0.15/1M tokens)
+            llm_completion_cost_per_million: Cost per 1M text LLM completion tokens (e.g., 0.60 for $0.60/1M tokens)
+            vision_prompt_cost_per_million: Cost per 1M vision LLM prompt tokens (e.g., 2.50 for $2.50/1M tokens)
+            vision_completion_cost_per_million: Cost per 1M vision LLM completion tokens (e.g., 10.0 for $10.0/1M tokens)
+            embedding_cost_per_million: Cost per 1M embedding tokens (e.g., 0.02 for $0.02/1M tokens)
+            
+        Example:
+            # Configure costs for GPT-4o-mini text and GPT-4o vision (example prices)
+            rag.configure_token_costs(
+                llm_prompt_cost_per_million=0.15,        # Text LLM: $0.15 per 1M prompt tokens
+                llm_completion_cost_per_million=0.60,    # Text LLM: $0.60 per 1M completion tokens
+                vision_prompt_cost_per_million=2.50,     # Vision LLM: $2.50 per 1M prompt tokens
+                vision_completion_cost_per_million=10.0, # Vision LLM: $10.0 per 1M completion tokens
+                embedding_cost_per_million=0.02          # Embedding: $0.02 per 1M tokens
+            )
+        """
+        self.token_tracker.set_costs(
+            llm_prompt_cost_per_million=llm_prompt_cost_per_million,
+            llm_completion_cost_per_million=llm_completion_cost_per_million,
+            vision_prompt_cost_per_million=vision_prompt_cost_per_million,
+            vision_completion_cost_per_million=vision_completion_cost_per_million,
+            embedding_cost_per_million=embedding_cost_per_million,
+        )
+        self.logger.info("Token costs configured successfully")
+        if llm_prompt_cost_per_million is not None:
+            self.logger.info(f"  Text LLM prompt: ${llm_prompt_cost_per_million}/1M tokens")
+        if llm_completion_cost_per_million is not None:
+            self.logger.info(f"  Text LLM completion: ${llm_completion_cost_per_million}/1M tokens")
+        if vision_prompt_cost_per_million is not None:
+            self.logger.info(f"  Vision LLM prompt: ${vision_prompt_cost_per_million}/1M tokens")
+        if vision_completion_cost_per_million is not None:
+            self.logger.info(f"  Vision LLM completion: ${vision_completion_cost_per_million}/1M tokens")
+        if embedding_cost_per_million is not None:
+            self.logger.info(f"  Embedding: ${embedding_cost_per_million}/1M tokens")
+
+    def get_token_usage(self) -> Dict[str, Any]:
+        """Get current token usage statistics.
+        
+        Returns:
+            Dictionary containing token usage and cost information
+        """
+        return {
+            "usage": self.token_tracker.get_usage(),
+            "costs": self.token_tracker.get_costs(),
+        }
+
+    def print_token_usage(self):
+        """Print formatted token usage and cost summary."""
+        print(self.token_tracker)
+
+    def reset_token_usage(self):
+        """Reset token usage counters."""
+        self.token_tracker.reset()
+        self.logger.info("Token usage counters reset")
+
+    def update_config(self, **kwargs):
+        """Update configuration with new values"""
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
+                self.logger.debug(f"Updated config: {key} = {value}")
+            else:
+                self.logger.warning(f"Unknown config parameter: {key}")
+
     async def _ensure_lightrag_initialized(self):
         """Ensure LightRAG instance is initialized, create if necessary"""
         try:
@@ -264,10 +423,15 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                         self.logger.info(
                             "Initializing parse cache for pre-provided LightRAG instance"
                         )
+                        # Store parse cache at the same level as rag_files to persist across index deletions
+                        # workspace will be the parent directory (e.g., ./)
+                        # The file will be created as ./kv_store_parse_cache.json
+                        parent_dir = os.path.dirname(self.lightrag.workspace)
+                        
                         self.parse_cache = (
                             self.lightrag.key_string_value_json_storage_cls(
                                 namespace="parse_cache",
-                                workspace=self.lightrag.workspace,
+                                workspace=parent_dir,
                                 global_config=self.lightrag.__dict__,
                                 embedding_func=self.embedding_func,
                             )
@@ -306,6 +470,10 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 "llm_model_func": self.llm_model_func,
                 "embedding_func": self.embedding_func,
             }
+            
+            # Add token_tracker if it exists
+            if self.token_tracker is not None:
+                lightrag_params["token_tracker"] = self.token_tracker
 
             # Merge user-provided lightrag_kwargs, which can override defaults
             lightrag_params.update(self.lightrag_kwargs)
@@ -326,9 +494,14 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 await initialize_pipeline_status()
 
                 # Initialize parse cache storage using LightRAG's KV storage
+                # Store parse cache at the same level as rag_files to persist across index deletions
+                # workspace will be the parent directory (e.g., ./)
+                # The file will be created as ./kv_store_parse_cache.json
+                parent_dir = os.path.dirname(self.lightrag.workspace)
+                
                 self.parse_cache = self.lightrag.key_string_value_json_storage_cls(
                     namespace="parse_cache",
-                    workspace=self.lightrag.workspace,
+                    workspace=parent_dir,
                     global_config=self.lightrag.__dict__,
                     embedding_func=self.embedding_func,
                 )

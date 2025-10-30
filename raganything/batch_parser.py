@@ -178,6 +178,29 @@ class BatchParser:
             file_output_dir = Path(output_dir) / file_name
             file_output_dir.mkdir(parents=True, exist_ok=True)
 
+            # Check if parsed output already exists on disk (optimization)
+            parser_name = self.parser_type  # "docling" or "mineru"
+            json_file = file_output_dir / parser_name / f"{file_name}.json"
+            
+            if json_file.exists():
+                self.logger.info(f"Found existing parsed output for {file_name}, skipping parse")
+                try:
+                    # Load existing parsed output
+                    parser_instance = self.parser
+                    content_list, _ = parser_instance._read_output_files(
+                        Path(output_dir), file_name
+                    )
+                    
+                    processing_time = time.time() - start_time
+                    self.logger.info(
+                        f"Loaded existing parse for {file_path} "
+                        f"({len(content_list)} content blocks, {processing_time:.2f}s)"
+                    )
+                    return True, file_path, None
+                    
+                except Exception as e:
+                    self.logger.warning(f"Failed to load existing parse for {file_name}: {e}. Will re-parse.")
+
             # Parse the document
             content_list = self.parser.parse_document(
                 file_path=file_path,

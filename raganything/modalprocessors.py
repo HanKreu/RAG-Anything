@@ -491,16 +491,115 @@ class BaseModalProcessor:
         await self.text_chunks_db.upsert({chunk_id: chunk_data})
 
         # Store chunk in vector database for retrieval
-        chunk_vdb_data = {
-            chunk_id: {
-                "content": modal_chunk,
-                "full_doc_id": actual_doc_id,
-                "tokens": tokens,
-                "chunk_order_index": chunk_order_index,
-                "file_path": file_path,
+        # Check if content is too large for embedding model (8192 token limit)
+        max_embed_tokens = 7000  # Safe limit below 8192
+        if tokens > max_embed_tokens:
+            # For large multimodal content, we need to preserve context while splitting
+            logger.warning(f"Chunk {chunk_id} has {tokens} tokens, splitting for embedding (limit: {max_embed_tokens})")
+            
+            # Extract structured parts from the modal_chunk
+            # This assumes modal_chunk follows a template with description/analysis
+            parts = modal_chunk.split('\n\n')
+            
+            # Try to identify the main content body (usually the largest part)
+            body_candidates = [(i, part) for i, part in enumerate(parts) if len(self.tokenizer.encode(part)) > max_embed_tokens // 2]
+            
+            if body_candidates:
+                # Found a large body section - split it while keeping context
+                body_idx, body_content = body_candidates[0]
+                context_parts = [p for i, p in enumerate(parts) if i != body_idx]
+                context_text = '\n\n'.join(context_parts)
+                context_tokens = len(self.tokenizer.encode(context_text))
+                
+                # Available tokens for body in each chunk
+                available_for_body = max_embed_tokens - context_tokens - 100  # Safety margin
+                
+                if available_for_body > 0:
+                    # Split the body content
+                    body_encoded = self.tokenizer.encode(body_content)
+                    body_chunks = []
+                    for i in range(0, len(body_encoded), available_for_body):
+                        chunk_part = self.tokenizer.decode(body_encoded[i:i + available_for_body])
+                        body_chunks.append(chunk_part)
+                    
+                    # Create sub-chunks with context preserved
+                    for idx, body_part in enumerate(body_chunks):
+                        # Reconstruct with context
+                        if body_idx == 0:
+                            # Body was first
+                            sub_content = f"{body_part}\n\n{context_text}"
+                        else:
+                            # Body was in middle/end
+                            before_body = '\n\n'.join(parts[:body_idx])
+                            after_body = '\n\n'.join(parts[body_idx+1:])
+                            if before_body and after_body:
+                                sub_content = f"{before_body}\n\n{body_part} [Part {idx+1}/{len(body_chunks)}]\n\n{after_body}"
+                            elif before_body:
+                                sub_content = f"{before_body}\n\n{body_part} [Part {idx+1}/{len(body_chunks)}]"
+                            else:
+                                sub_content = f"{body_part} [Part {idx+1}/{len(body_chunks)}]\n\n{after_body}"
+                        
+                        sub_chunk_id = f"{chunk_id}_part{idx}"
+                        sub_tokens = len(self.tokenizer.encode(sub_content))
+                        await self.chunks_vdb.upsert({
+                            sub_chunk_id: {
+                                "content": sub_content,
+                                "full_doc_id": actual_doc_id,
+                                "tokens": sub_tokens,
+                                "chunk_order_index": chunk_order_index,
+                                "file_path": file_path,
+                            }
+                        })
+                        logger.info(f"Inserted sub-chunk {idx+1}/{len(body_chunks)} with {sub_tokens} tokens (preserving context)")
+                else:
+                    # Context itself is too large - fall back to simple splitting
+                    logger.warning(f"Context too large ({context_tokens} tokens), using simple split")
+                    encoded_tokens = self.tokenizer.encode(modal_chunk)
+                    for i in range(0, len(encoded_tokens), max_embed_tokens):
+                        sub_chunk_tokens = encoded_tokens[i:i + max_embed_tokens]
+                        sub_chunk_content = self.tokenizer.decode(sub_chunk_tokens)
+                        sub_chunk_id = f"{chunk_id}_part{i//max_embed_tokens}"
+                        sub_tokens = len(sub_chunk_tokens)
+                        await self.chunks_vdb.upsert({
+                            sub_chunk_id: {
+                                "content": sub_chunk_content,
+                                "full_doc_id": actual_doc_id,
+                                "tokens": sub_tokens,
+                                "chunk_order_index": chunk_order_index,
+                                "file_path": file_path,
+                            }
+                        })
+            else:
+                # No single large part - simple token-based split
+                encoded_tokens = self.tokenizer.encode(modal_chunk)
+                num_parts = (len(encoded_tokens) + max_embed_tokens - 1) // max_embed_tokens
+                for i in range(0, len(encoded_tokens), max_embed_tokens):
+                    sub_chunk_tokens = encoded_tokens[i:i + max_embed_tokens]
+                    sub_chunk_content = self.tokenizer.decode(sub_chunk_tokens)
+                    sub_chunk_id = f"{chunk_id}_part{i//max_embed_tokens}"
+                    sub_tokens = len(sub_chunk_tokens)
+                    await self.chunks_vdb.upsert({
+                        sub_chunk_id: {
+                            "content": sub_chunk_content,
+                            "full_doc_id": actual_doc_id,
+                            "tokens": sub_tokens,
+                            "chunk_order_index": chunk_order_index,
+                            "file_path": file_path,
+                        }
+                    })
+                logger.info(f"Split into {num_parts} parts using simple token split")
+        else:
+            # Content is within limits, insert as-is
+            chunk_vdb_data = {
+                chunk_id: {
+                    "content": modal_chunk,
+                    "full_doc_id": actual_doc_id,
+                    "tokens": tokens,
+                    "chunk_order_index": chunk_order_index,
+                    "file_path": file_path,
+                }
             }
-        }
-        await self.chunks_vdb.upsert(chunk_vdb_data)
+            await self.chunks_vdb.upsert(chunk_vdb_data)
 
         # Create entity node
         node_data = {

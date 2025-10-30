@@ -12,7 +12,7 @@ from lightrag.utils import logger
 
 def separate_content(
     content_list: List[Dict[str, Any]],
-) -> Tuple[str, List[Dict[str, Any]]]:
+) -> Tuple[str, List[Dict[str, Any]], Dict[int, int]]:
     """
     Separate text content and multimodal content
 
@@ -20,10 +20,15 @@ def separate_content(
         content_list: Content list from MinerU parsing
 
     Returns:
-        (text_content, multimodal_items): Pure text content and multimodal items list
+        (text_content, multimodal_items, page_idx_map): 
+            - Pure text content
+            - Multimodal items list
+            - Mapping from character position to page_idx
     """
     text_parts = []
     multimodal_items = []
+    page_idx_map = {}  # Maps character position to page_idx
+    current_pos = 0
 
     for item in content_list:
         content_type = item.get("type", "text")
@@ -32,7 +37,15 @@ def separate_content(
             # Text content
             text = item.get("text", "")
             if text.strip():
+                page_idx = item.get("page_idx", 1)  # Default to page 1 if not specified
+                # Record the page_idx for this text block's character range
+                start_pos = current_pos
                 text_parts.append(text)
+                end_pos = current_pos + len(text)
+                # Map every character position in this range to the page_idx
+                for pos in range(start_pos, end_pos):
+                    page_idx_map[pos] = page_idx
+                current_pos = end_pos + 2  # Account for "\n\n" separator
         else:
             # Multimodal content (image, table, equation, etc.)
             multimodal_items.append(item)
@@ -43,6 +56,7 @@ def separate_content(
     logger.info("Content separation complete:")
     logger.info(f"  - Text content length: {len(text_content)} characters")
     logger.info(f"  - Multimodal items count: {len(multimodal_items)}")
+    logger.info(f"  - Page index tracking: {len(set(page_idx_map.values()))} unique pages")
 
     # Count multimodal types
     modal_types = {}
@@ -53,7 +67,7 @@ def separate_content(
     if modal_types:
         logger.info(f"  - Multimodal type distribution: {modal_types}")
 
-    return text_content, multimodal_items
+    return text_content, multimodal_items, page_idx_map
 
 
 def encode_image_to_base64(image_path: str) -> str:
@@ -146,6 +160,7 @@ async def insert_text_content(
     split_by_character_only: bool = False,
     ids: str | list[str] | None = None,
     file_paths: str | list[str] | None = None,
+    page_idx_map: Dict[int, int] | None = None,
 ):
     """
     Insert pure text content into LightRAG
@@ -159,6 +174,7 @@ async def insert_text_content(
         split_by_character is None, this parameter is ignored.
         ids: single string of the document ID or list of unique document IDs, if not provided, MD5 hash IDs will be generated
         file_paths: single string of the file path or list of file paths, used for citation
+        page_idx_map: Optional mapping from character position to page_idx for preserving page information
     """
     logger.info("Starting text content insertion into LightRAG...")
 
@@ -169,6 +185,7 @@ async def insert_text_content(
         split_by_character=split_by_character,
         split_by_character_only=split_by_character_only,
         ids=ids,
+        page_idx_map=page_idx_map,
     )
 
     logger.info("Text content insertion complete")
@@ -183,6 +200,7 @@ async def insert_text_content_with_multimodal_content(
     ids: str | list[str] | None = None,
     file_paths: str | list[str] | None = None,
     scheme_name: str | None = None,
+    page_idx_map: Dict[int, int] | None = None,
 ):
     """
     Insert pure text content into LightRAG
@@ -198,6 +216,7 @@ async def insert_text_content_with_multimodal_content(
         ids: single string of the document ID or list of unique document IDs, if not provided, MD5 hash IDs will be generated
         file_paths: single string of the file path or list of file paths, used for citation
         scheme_name: scheme name (optional)
+        page_idx_map: Optional mapping from character position to page_idx for preserving page information
     """
     logger.info("Starting text content insertion into LightRAG...")
 
@@ -211,6 +230,7 @@ async def insert_text_content_with_multimodal_content(
             split_by_character_only=split_by_character_only,
             ids=ids,
             scheme_name=scheme_name,
+            page_idx_map=page_idx_map,
         )
     except Exception as e:
         logger.info(f"Error: {e}")

@@ -1235,12 +1235,52 @@ class DoclingParser(Parser):
         """Initialize DoclingParser"""
         super().__init__()
 
+    def _filter_content_by_page_range(
+        self,
+        content_list: List[Dict[str, Any]],
+        start_page: Optional[int] = None,
+        end_page: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter content blocks by page range
+        
+        Args:
+            content_list: List of content blocks
+            start_page: Starting page number (1-based, inclusive)
+            end_page: Ending page number (1-based, inclusive)
+        
+        Returns:
+            Filtered list of content blocks
+        """
+        if start_page is None and end_page is None:
+            return content_list
+        
+        filtered_content = []
+        for block in content_list:
+            page_idx = block.get("page_idx", 1)
+            
+            # Check if page is within range
+            if start_page is not None and page_idx < start_page:
+                continue
+            if end_page is not None and page_idx > end_page:
+                continue
+            
+            filtered_content.append(block)
+        
+        logging.info(
+            f"Filtered {len(content_list)} blocks to {len(filtered_content)} blocks "
+            f"(pages {start_page or 1}-{end_page or 'end'})"
+        )
+        return filtered_content
+
     def parse_pdf(
         self,
         pdf_path: Union[str, Path],
         output_dir: Optional[str] = None,
         method: str = "auto",
         lang: Optional[str] = None,
+        start_page: int = None,
+        end_page: int = None,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
@@ -1251,6 +1291,8 @@ class DoclingParser(Parser):
             output_dir: Output directory path
             method: Parsing method (auto, txt, ocr)
             lang: Document language for OCR optimization
+            start_page: Starting page number (1-based, inclusive)
+            end_page: Ending page number (1-based, inclusive)
             **kwargs: Additional parameters for docling command
 
         Returns:
@@ -1272,11 +1314,13 @@ class DoclingParser(Parser):
 
             base_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Run docling command
+            # Run docling command with page limits if specified
             self._run_docling_command(
                 input_path=pdf_path,
                 output_dir=base_output_dir,
                 file_stem=name_without_suff,
+                start_page=start_page,
+                end_page=end_page,
                 **kwargs,
             )
 
@@ -1284,6 +1328,14 @@ class DoclingParser(Parser):
             content_list, _ = self._read_output_files(
                 base_output_dir, name_without_suff
             )
+            
+            # Additional filtering if needed (belt and suspenders approach)
+            # In case docling doesn't support page ranges or returns unexpected pages
+            if start_page is not None or end_page is not None:
+                content_list = self._filter_content_by_page_range(
+                    content_list, start_page, end_page
+                )
+            
             return content_list
 
         except Exception as e:
@@ -1338,70 +1390,92 @@ class DoclingParser(Parser):
         input_path: Union[str, Path],
         output_dir: Union[str, Path],
         file_stem: str,
+        start_page: int = None,
+        end_page: int = None,
         **kwargs,
     ) -> None:
         """
-        Run docling command line tool
-
+        Run docling using Python API with page range support
+        
         Args:
-            input_path: Path to input file or directory
+            input_path: Path to input file
             output_dir: Output directory path
             file_stem: File stem for creating subdirectory
-            **kwargs: Additional parameters for docling command
+            start_page: Starting page number (1-based, inclusive) for PDF parsing
+            end_page: Ending page number (1-based, inclusive) for PDF parsing
+            **kwargs: Additional parameters for docling
         """
-        # Create subdirectory structure similar to MinerU
-        file_output_dir = Path(output_dir) / file_stem / "docling"
-        file_output_dir.mkdir(parents=True, exist_ok=True)
-
-        cmd_json = [
-            "docling",
-            "--output",
-            str(file_output_dir),
-            "--to",
-            "json",
-            str(input_path),
-        ]
-        cmd_md = [
-            "docling",
-            "--output",
-            str(file_output_dir),
-            "--to",
-            "md",
-            str(input_path),
-        ]
-
         try:
-            # Prepare subprocess parameters to hide console window on Windows
-            import platform
-
-            docling_subprocess_kwargs = {
-                "capture_output": True,
-                "text": True,
-                "check": True,
-                "encoding": "utf-8",
-                "errors": "ignore",
-            }
-
-            # Hide console window on Windows
-            if platform.system() == "Windows":
-                docling_subprocess_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-            result_json = subprocess.run(cmd_json, **docling_subprocess_kwargs)
-            result_md = subprocess.run(cmd_md, **docling_subprocess_kwargs)
-            logging.info("Docling command executed successfully")
-            if result_json.stdout:
-                logging.debug(f"JSON cmd output: {result_json.stdout}")
-            if result_md.stdout:
-                logging.debug(f"Markdown cmd output: {result_md.stdout}")
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Error running docling command: {e}")
-            if e.stderr:
-                logging.error(f"Error details: {e.stderr}")
-            raise
-        except FileNotFoundError:
-            raise RuntimeError(
-                "docling command not found. Please ensure Docling is properly installed."
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.datamodel.base_models import InputFormat
+            from docling_core.types.doc import PictureItem, TableItem
+            from pathlib import Path
+            import json
+            
+            # Create subdirectory structure
+            file_output_dir = Path(output_dir) / file_stem / "docling"
+            file_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Configure pipeline to generate picture images
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.images_scale = 2.0  # Higher resolution images
+            pipeline_options.generate_picture_images = True
+            
+            # Prepare page range as tuple (both 1-based, inclusive)
+            convert_kwargs = {}
+            if start_page is not None or end_page is not None:
+                # Use a very large number for "end of document"
+                start = start_page if start_page is not None else 1
+                end = end_page if end_page is not None else 999999
+                convert_kwargs["page_range"] = (start, end)
+                logging.info(f"Processing pages {start} to {end}")
+            
+            # Initialize document converter with pipeline options
+            doc_converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                }
             )
+            
+            # Convert document
+            conv_result = doc_converter.convert(str(input_path), **convert_kwargs)
+            
+            # Create images directory
+            image_dir = file_output_dir / "images"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save images using the correct API - iterate and save PictureItems
+            picture_counter = 0
+            for element, _level in conv_result.document.iterate_items():
+                if isinstance(element, PictureItem):
+                    picture_counter += 1
+                    image_path = image_dir / f"image_{picture_counter}.png"
+                    with image_path.open("wb") as fp:
+                        element.get_image(conv_result.document).save(fp, "PNG")
+            
+            # Save JSON output
+            json_output_path = file_output_dir / f"{file_stem}.json"
+            with open(json_output_path, 'w', encoding='utf-8') as f:
+                json.dump(conv_result.document.export_to_dict(), f, ensure_ascii=False, indent=2)
+            
+            # Save Markdown output
+            md_output_path = file_output_dir / f"{file_stem}.md"
+            with open(md_output_path, 'w', encoding='utf-8') as f:
+                f.write(conv_result.document.export_to_markdown())
+            
+            logging.info(f"Docling conversion completed successfully")
+            logging.info(f"JSON output: {json_output_path}")
+            logging.info(f"Markdown output: {md_output_path}")
+            logging.info(f"Extracted {picture_counter} images")
+            
+        except ImportError as e:
+            raise RuntimeError(
+                f"docling package not found or incomplete: {e}. Please install it using: pip install docling"
+            )
+        except Exception as e:
+            logging.error(f"Error running docling conversion: {e}")
+            raise
 
     def _read_output_files(
         self,
@@ -1492,10 +1566,10 @@ class DoclingParser(Parser):
     def read_from_block(
         self, block, type: str, output_dir: Path, cnt: int, num: str
     ) -> Dict[str, Any]:
-        # Extract actual page number from prov field, default to 0 if not available
-        page_idx = 0
+        # Extract actual page number from prov field, keep as 1-based
+        page_idx = 1  # Default to page 1
         if "prov" in block and len(block["prov"]) > 0:
-            page_idx = block["prov"][0].get("page_no", 1) - 1  # Convert to 0-based indexing
+            page_idx = block["prov"][0].get("page_no", 1)  # Keep 1-based indexing
         
         if type == "texts":
             if block["label"] == "formula":
@@ -1513,27 +1587,44 @@ class DoclingParser(Parser):
                     "page_idx": page_idx,
                 }
         elif type == "pictures":
+            # Images are saved during conversion via PictureItem.get_image()
+            # The JSON just contains metadata - actual images are in images/ directory
             try:
-                base64_uri = block["image"]["uri"]
-                base64_str = base64_uri.split(",")[1]
-                # Create images directory within the docling subdirectory
+                # Get caption text
+                caption = ""
+                if "caption" in block:
+                    if isinstance(block["caption"], dict):
+                        caption = block["caption"].get("text", "")
+                    else:
+                        caption = str(block["caption"])
+                
+                # Images are already saved by _run_docling_command using the official API
+                # They are numbered sequentially as image_1.png, image_2.png, etc.
+                # The 'num' parameter corresponds to the sequential picture number
                 image_dir = output_dir / "images"
-                image_dir.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
                 image_path = image_dir / f"image_{num}.png"
-                with open(image_path, "wb") as f:
-                    f.write(base64.b64decode(base64_str))
-                return {
-                    "type": "image",
-                    "img_path": str(image_path.resolve()),  # Convert to absolute path
-                    "image_caption": block.get("caption", ""),
-                    "image_footnote": block.get("footnote", ""),
-                    "page_idx": page_idx,
-                }
+                
+                if image_path.exists():
+                    return {
+                        "type": "image",
+                        "img_path": str(image_path.resolve()),
+                        "image_caption": caption,
+                        "image_footnote": block.get("footnote", ""),
+                        "page_idx": page_idx,
+                    }
+                else:
+                    # Image file doesn't exist, return placeholder
+                    logging.debug(f"Image file not found: {image_path}")
+                    return {
+                        "type": "text",
+                        "text": f"[Image: {caption}]",
+                        "page_idx": page_idx,
+                    }
             except Exception as e:
                 logging.warning(f"Failed to process image {num}: {e}")
                 return {
                     "type": "text",
-                    "text": f"[Image processing failed: {block.get('caption', '')}]",
+                    "text": f"[Image processing failed]",
                     "page_idx": page_idx,
                 }
         else:
