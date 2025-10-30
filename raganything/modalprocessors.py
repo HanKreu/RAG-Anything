@@ -470,8 +470,14 @@ class BaseModalProcessor:
         batch_mode: bool = False,
         doc_id: str = None,
         chunk_order_index: int = 0,
+        img_path: str = None,  # Image path metadata
+        page_idx: int = None,  # Page index metadata
     ) -> Tuple[str, Dict[str, Any]]:
         """Create entity and text chunk"""
+        print(f"\n=== _create_entity_and_chunk DEBUG ===")
+        print(f"img_path parameter: {img_path}")
+        print(f"page_idx parameter: {page_idx}")
+        
         # Create chunk
         chunk_id = compute_mdhash_id(str(modal_chunk), prefix="chunk-")
         tokens = len(self.tokenizer.encode(modal_chunk))
@@ -486,6 +492,22 @@ class BaseModalProcessor:
             "full_doc_id": actual_doc_id,  # Use proper document ID
             "file_path": file_path,
         }
+
+        # Add optional metadata fields if provided
+        if img_path is not None:
+            chunk_data["img_path"] = img_path
+            print(f"✓ Added img_path to chunk_data: {img_path}")
+        else:
+            print(f"✗ img_path is None, not adding to chunk_data")
+            
+        if page_idx is not None:
+            chunk_data["page_idx"] = page_idx
+            print(f"✓ Added page_idx to chunk_data: {page_idx}")
+        else:
+            print(f"✗ page_idx is None, not adding to chunk_data")
+        
+        print(f"Final chunk_data keys: {chunk_data.keys()}")
+        print(f"chunk_data: {chunk_data}")
 
         # Store chunk
         await self.text_chunks_db.upsert({chunk_id: chunk_data})
@@ -541,15 +563,20 @@ class BaseModalProcessor:
                         
                         sub_chunk_id = f"{chunk_id}_part{idx}"
                         sub_tokens = len(self.tokenizer.encode(sub_content))
-                        await self.chunks_vdb.upsert({
-                            sub_chunk_id: {
-                                "content": sub_content,
-                                "full_doc_id": actual_doc_id,
-                                "tokens": sub_tokens,
-                                "chunk_order_index": chunk_order_index,
-                                "file_path": file_path,
-                            }
-                        })
+                        sub_chunk_data = {
+                            "content": sub_content,
+                            "full_doc_id": actual_doc_id,
+                            "tokens": sub_tokens,
+                            "chunk_order_index": chunk_order_index,
+                            "file_path": file_path,
+                        }
+                        # Add optional metadata if provided
+                        if img_path is not None:
+                            sub_chunk_data["img_path"] = img_path
+                        if page_idx is not None:
+                            sub_chunk_data["page_idx"] = page_idx
+                        
+                        await self.chunks_vdb.upsert({sub_chunk_id: sub_chunk_data})
                         logger.info(f"Inserted sub-chunk {idx+1}/{len(body_chunks)} with {sub_tokens} tokens (preserving context)")
                 else:
                     # Context itself is too large - fall back to simple splitting
@@ -560,15 +587,20 @@ class BaseModalProcessor:
                         sub_chunk_content = self.tokenizer.decode(sub_chunk_tokens)
                         sub_chunk_id = f"{chunk_id}_part{i//max_embed_tokens}"
                         sub_tokens = len(sub_chunk_tokens)
-                        await self.chunks_vdb.upsert({
-                            sub_chunk_id: {
-                                "content": sub_chunk_content,
-                                "full_doc_id": actual_doc_id,
-                                "tokens": sub_tokens,
-                                "chunk_order_index": chunk_order_index,
-                                "file_path": file_path,
-                            }
-                        })
+                        sub_chunk_data = {
+                            "content": sub_chunk_content,
+                            "full_doc_id": actual_doc_id,
+                            "tokens": sub_tokens,
+                            "chunk_order_index": chunk_order_index,
+                            "file_path": file_path,
+                        }
+                        # Add optional metadata if provided
+                        if img_path is not None:
+                            sub_chunk_data["img_path"] = img_path
+                        if page_idx is not None:
+                            sub_chunk_data["page_idx"] = page_idx
+                        
+                        await self.chunks_vdb.upsert({sub_chunk_id: sub_chunk_data})
             else:
                 # No single large part - simple token-based split
                 encoded_tokens = self.tokenizer.encode(modal_chunk)
@@ -578,28 +610,43 @@ class BaseModalProcessor:
                     sub_chunk_content = self.tokenizer.decode(sub_chunk_tokens)
                     sub_chunk_id = f"{chunk_id}_part{i//max_embed_tokens}"
                     sub_tokens = len(sub_chunk_tokens)
-                    await self.chunks_vdb.upsert({
-                        sub_chunk_id: {
-                            "content": sub_chunk_content,
-                            "full_doc_id": actual_doc_id,
-                            "tokens": sub_tokens,
-                            "chunk_order_index": chunk_order_index,
-                            "file_path": file_path,
-                        }
-                    })
+                    sub_chunk_data = {
+                        "content": sub_chunk_content,
+                        "full_doc_id": actual_doc_id,
+                        "tokens": sub_tokens,
+                        "chunk_order_index": chunk_order_index,
+                        "file_path": file_path,
+                    }
+                    # Add optional metadata if provided
+                    if img_path is not None:
+                        sub_chunk_data["img_path"] = img_path
+                    if page_idx is not None:
+                        sub_chunk_data["page_idx"] = page_idx
+                    
+                    await self.chunks_vdb.upsert({sub_chunk_id: sub_chunk_data})
                 logger.info(f"Split into {num_parts} parts using simple token split")
         else:
             # Content is within limits, insert as-is
             chunk_vdb_data = {
-                chunk_id: {
-                    "content": modal_chunk,
-                    "full_doc_id": actual_doc_id,
-                    "tokens": tokens,
-                    "chunk_order_index": chunk_order_index,
-                    "file_path": file_path,
-                }
+                "content": modal_chunk,
+                "full_doc_id": actual_doc_id,
+                "tokens": tokens,
+                "chunk_order_index": chunk_order_index,
+                "file_path": file_path,
             }
-            await self.chunks_vdb.upsert(chunk_vdb_data)
+            # Add optional metadata if provided
+            if img_path is not None:
+                chunk_vdb_data["img_path"] = img_path
+                print(f"✓ Added img_path to vdb chunk: {img_path}")
+            if page_idx is not None:
+                chunk_vdb_data["page_idx"] = page_idx
+                print(f"✓ Added page_idx to vdb chunk: {page_idx}")
+            
+            print(f"Upserting to chunks_vdb - chunk_id: {chunk_id}")
+            print(f"chunk_vdb_data keys: {chunk_vdb_data.keys()}")
+            print(f"chunk_vdb_data: {chunk_vdb_data}")
+            
+            await self.chunks_vdb.upsert({chunk_id: chunk_vdb_data})
 
         # Create entity node
         node_data = {
@@ -1024,56 +1071,48 @@ class ImageModalProcessor(BaseModalProcessor):
         chunk_order_index: int = 0,
     ) -> Tuple[str, Dict[str, Any]]:
         """Process image content with context support"""
-        try:
-            # Generate description and entity info
-            enhanced_caption, entity_info = await self.generate_description_only(
-                modal_content, content_type, item_info, entity_name
-            )
+        # Generate description and entity info
+        enhanced_caption, entity_info = await self.generate_description_only(
+            modal_content, content_type, item_info, entity_name
+        )
 
-            # Build complete image content
-            if isinstance(modal_content, str):
-                try:
-                    content_data = json.loads(modal_content)
-                except json.JSONDecodeError:
-                    content_data = {"description": modal_content}
-            else:
-                content_data = modal_content
+        # Build complete image content
+        if isinstance(modal_content, str):
+            try:
+                content_data = json.loads(modal_content)
+            except json.JSONDecodeError:
+                content_data = {"description": modal_content}
+        else:
+            content_data = modal_content
 
-            image_path = content_data.get("img_path", "")
-            captions = content_data.get(
-                "image_caption", content_data.get("img_caption", [])
-            )
-            footnotes = content_data.get(
-                "image_footnote", content_data.get("img_footnote", [])
-            )
+        image_path = content_data.get("img_path", "")
+        captions = content_data.get(
+            "image_caption", content_data.get("img_caption", [])
+        )
+        footnotes = content_data.get(
+            "image_footnote", content_data.get("img_footnote", [])
+        )
+        
+        # Extract page_idx from content_data if available
+        page_idx = content_data.get("page_idx")
+        
+        modal_chunk = PROMPTS["image_chunk"].format(
+            image_path=image_path,
+            captions=", ".join(captions) if captions else "None",
+            footnotes=", ".join(footnotes) if footnotes else "None",
+            enhanced_caption=enhanced_caption,
+        )
 
-            modal_chunk = PROMPTS["image_chunk"].format(
-                image_path=image_path,
-                captions=", ".join(captions) if captions else "None",
-                footnotes=", ".join(footnotes) if footnotes else "None",
-                enhanced_caption=enhanced_caption,
-            )
-
-            return await self._create_entity_and_chunk(
-                modal_chunk,
-                entity_info,
-                file_path,
-                batch_mode,
-                doc_id,
-                chunk_order_index,
-            )
-
-        except Exception as e:
-            logger.error(f"Error processing image content: {e}")
-            # Fallback processing
-            fallback_entity = {
-                "entity_name": entity_name
-                if entity_name
-                else f"image_{compute_mdhash_id(str(modal_content))}",
-                "entity_type": "image",
-                "summary": f"Image content: {str(modal_content)[:100]}",
-            }
-            return str(modal_content), fallback_entity
+        return await self._create_entity_and_chunk(
+            modal_chunk,
+            entity_info,
+            file_path,
+            batch_mode,
+            doc_id,
+            chunk_order_index,
+            img_path=image_path,  # Pass image path as metadata
+            page_idx=page_idx,  # Pass page_idx if available
+        )
 
     def _parse_response(
         self, response: str, entity_name: str = None
@@ -1219,6 +1258,9 @@ class TableModalProcessor(BaseModalProcessor):
         chunk_order_index: int = 0,
     ) -> Tuple[str, Dict[str, Any]]:
         """Process table content with context support"""
+        print(f"\n=== TableModalProcessor.process_multimodal_content DEBUG ===")
+        print(f"modal_content type: {type(modal_content)}")
+        
         try:
             # Generate description and entity info
             enhanced_caption, entity_info = await self.generate_description_only(
@@ -1234,10 +1276,16 @@ class TableModalProcessor(BaseModalProcessor):
             else:
                 content_data = modal_content
 
+            print(f"content_data keys: {content_data.keys() if isinstance(content_data, dict) else 'N/A'}")
+            
             table_img_path = content_data.get("img_path")
             table_caption = content_data.get("table_caption", [])
             table_body = content_data.get("table_body", "")
             table_footnote = content_data.get("table_footnote", [])
+            page_idx = content_data.get("page_idx")
+            
+            print(f"Extracted table_img_path: {table_img_path}")
+            print(f"Extracted page_idx: {page_idx}")
 
             # Build complete table content
             modal_chunk = PROMPTS["table_chunk"].format(
@@ -1255,6 +1303,8 @@ class TableModalProcessor(BaseModalProcessor):
                 batch_mode,
                 doc_id,
                 chunk_order_index,
+                img_path=table_img_path,
+                page_idx=page_idx,
             )
 
         except Exception as e:
@@ -1424,6 +1474,7 @@ class EquationModalProcessor(BaseModalProcessor):
 
             equation_text = content_data.get("text")
             equation_format = content_data.get("text_format", "")
+            page_idx = content_data.get("page_idx")
 
             # Build complete equation content
             modal_chunk = PROMPTS["equation_chunk"].format(
@@ -1439,6 +1490,8 @@ class EquationModalProcessor(BaseModalProcessor):
                 batch_mode,
                 doc_id,
                 chunk_order_index,
+                img_path=None,  # Equations don't have image paths
+                page_idx=page_idx,
             )
 
         except Exception as e:

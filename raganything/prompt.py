@@ -351,3 +351,9 @@ PROMPTS["QUERY_GENERIC_ANALYST_SYSTEM"] = (
 PROMPTS["QUERY_ENHANCEMENT_SUFFIX"] = (
     "\n\nPlease provide a comprehensive answer based on the user query and the provided multimodal content information."
 )
+
+PROMPTS["QUERY_IMAGE_REFERENCE_INSTRUCTION"] = (
+    "\n\nIMPORTANT: When referring to images in your answer, use the exact 'Image Path:' "
+    "format as shown in the context. Do NOT create markdown image links. "
+    "Simply reference the path like: 'See Image Path: C:\\path\\to\\image.png'"
+)

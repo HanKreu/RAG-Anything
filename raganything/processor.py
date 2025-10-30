@@ -948,6 +948,11 @@ class ProcessorMixin:
                 "original_type": data["content_type"],
                 "page_idx": data["item_info"].get("page_idx", 0),
             }
+            
+            # Add img_path if available
+            img_path = original_item.get("img_path")
+            if img_path:
+                chunks[chunk_id]["img_path"] = img_path
 
         self.logger.debug(
             f"Converted {len(chunks)} multimodal items to multimodal chunks format"

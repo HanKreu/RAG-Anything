@@ -7,7 +7,7 @@ Contains all query-related methods for both text and multimodal queries
 import json
 import hashlib
 import re
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple, Optional
 from pathlib import Path
 from lightrag import QueryParam
 from lightrag.utils import always_get_an_event_loop
@@ -21,6 +21,55 @@ from raganything.utils import (
 
 class QueryMixin:
     """QueryMixin class containing query functionality for RAGAnything"""
+
+    def _extract_images_from_context(
+        self, context: str, return_absolute: bool = True
+    ) -> List[str]:
+        """
+        Extract image paths from retrieved context
+
+        Args:
+            context: Retrieved context text containing image paths
+            return_absolute: If True, return absolute paths; if False, return relative paths
+
+        Returns:
+            List[str]: List of unique image paths found in context
+        """
+        # Pattern to match image paths in the chunk content
+        image_path_pattern = (
+            r"Image Path:\s*([^\r\n]*?\.(?:jpg|jpeg|png|gif|bmp|webp|tiff|tif))"
+        )
+
+        matches = re.findall(image_path_pattern, context, re.IGNORECASE)
+        
+        # Deduplicate and validate paths
+        unique_images = []
+        seen_paths = set()
+        
+        for match in matches:
+            image_path = match.strip()
+            
+            # Skip if already seen
+            if image_path in seen_paths:
+                continue
+                
+            seen_paths.add(image_path)
+            
+            # Validate that the file exists
+            if validate_image_file(image_path):
+                if return_absolute:
+                    # Ensure absolute path
+                    abs_path = str(Path(image_path).resolve())
+                    unique_images.append(abs_path)
+                else:
+                    unique_images.append(image_path)
+            else:
+                self.logger.debug(f"Skipping invalid image path: {image_path}")
+        
+        if unique_images:
+            self.logger.info(f"📷 Extracted {len(unique_images)} unique images from context")
+        
+        return unique_images
 
     def _generate_multimodal_cache_key(
         self, query: str, multimodal_content: List[Dict[str, Any]], mode: str, **kwargs
@@ -97,7 +146,7 @@ class QueryMixin:
 
         return f"multimodal_query:{cache_hash}"
 
-    async def aquery(self, query: str, mode: str = "mix", **kwargs) -> str:
+    async def aquery(self, query: str, mode: str = "mix", **kwargs) -> str | Dict[str, Any]:
         """
         Pure text query - directly calls LightRAG's query functionality
 
@@ -108,9 +157,12 @@ class QueryMixin:
                 - vlm_enhanced: bool, default True when vision_model_func is available.
                   If True, will parse image paths in retrieved context and replace them
                   with base64 encoded images for VLM processing.
+                - return_images: bool, default False. If True, returns a dict with both
+                  'answer' and 'images' (list of image paths from retrieved chunks).
 
         Returns:
-            str: Query result
+            str | Dict[str, Any]: Query result string, or dict with 'answer' and 'images' 
+                                  if return_images=True
         """
         if self.lightrag is None:
             raise ValueError(
@@ -119,6 +171,7 @@ class QueryMixin:
 
         # Check if VLM enhanced query should be used
         vlm_enhanced = kwargs.pop("vlm_enhanced", None)
+        return_images = kwargs.pop("return_images", False)
 
         # Auto-determine VLM enhanced based on availability
         if vlm_enhanced is None:
@@ -127,30 +180,62 @@ class QueryMixin:
                 and self.vision_model_func is not None
             )
 
+        # Extract images if requested
+        retrieved_images = []
+        
+        # If return_images is True, we need to get the context first
+        if return_images:
+            # Get context using only_need_context parameter
+            query_param_context = QueryParam(mode=mode, only_need_context=True, **kwargs)
+            context = await self.lightrag.aquery(query, param=query_param_context)
+            
+            # Extract images from context
+            retrieved_images = self._extract_images_from_context(context)
+            
+            self.logger.info(f"Found {len(retrieved_images)} images in retrieved context")
+
         # Use VLM enhanced query if enabled and available
         if (
             vlm_enhanced
             and hasattr(self, "vision_model_func")
             and self.vision_model_func
         ):
-            return await self.aquery_vlm_enhanced(query, mode=mode, **kwargs)
+            result = await self.aquery_vlm_enhanced(query, mode=mode, **kwargs)
         elif vlm_enhanced and (
             not hasattr(self, "vision_model_func") or not self.vision_model_func
         ):
             self.logger.warning(
                 "VLM enhanced query requested but vision_model_func is not available, falling back to normal query"
             )
+            # Create query parameters
+            query_param = QueryParam(mode=mode, **kwargs)
 
-        # Create query parameters
-        query_param = QueryParam(mode=mode, **kwargs)
+            self.logger.info(f"Executing text query: {query[:100]}...")
+            self.logger.info(f"Query mode: {mode}")
 
-        self.logger.info(f"Executing text query: {query[:100]}...")
-        self.logger.info(f"Query mode: {mode}")
+            # Call LightRAG's query method
+            result = await self.lightrag.aquery(query, param=query_param)
 
-        # Call LightRAG's query method
-        result = await self.lightrag.aquery(query, param=query_param)
+            self.logger.info("Text query completed")
+        else:
+            # Create query parameters
+            query_param = QueryParam(mode=mode, **kwargs)
 
-        self.logger.info("Text query completed")
+            self.logger.info(f"Executing text query: {query[:100]}...")
+            self.logger.info(f"Query mode: {mode}")
+
+            # Call LightRAG's query method
+            result = await self.lightrag.aquery(query, param=query_param)
+
+            self.logger.info("Text query completed")
+        
+        # Return result with images if requested
+        if return_images:
+            return {
+                "answer": result,
+                "images": retrieved_images
+            }
+        
         return result
 
     async def aquery_with_multimodal(
@@ -706,7 +791,7 @@ class QueryMixin:
             raise
 
     # Synchronous versions of query methods
-    def query(self, query: str, mode: str = "mix", **kwargs) -> str:
+    def query(self, query: str, mode: str = "mix", **kwargs) -> str | Dict[str, Any]:
         """
         Synchronous version of pure text query
 
@@ -717,9 +802,12 @@ class QueryMixin:
                 - vlm_enhanced: bool, default True when vision_model_func is available.
                   If True, will parse image paths in retrieved context and replace them
                   with base64 encoded images for VLM processing.
+                - return_images: bool, default False. If True, returns a dict with both
+                  'answer' and 'images' (list of image paths from retrieved chunks).
 
         Returns:
-            str: Query result
+            str | Dict[str, Any]: Query result string, or dict with 'answer' and 'images' 
+                                  if return_images=True
         """
         loop = always_get_an_event_loop()
         return loop.run_until_complete(self.aquery(query, mode=mode, **kwargs))
